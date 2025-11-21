@@ -46,11 +46,23 @@ struct HTTPResponse {
     bool send_file;
 };
 
+struct ConnectionState{
+	int fd;
+	string read_buffer;
+	queue<HTTPRequest> request_queue;
+	bool keep_alive;
+	time_t last_activity;
+
+	ConnectionState(int socketfd):fd(socketfd),keep_alive(true),last_activity(time(nullptr)){}
+};
+
 class HTTPServer {
 private:
     unsigned short port;
     string doc_root;
     int server_fd;
+
+	const int CONNECTION_TIMEOUT = 5;
 
     // HTTP状态码映射
     map<int, string> status_messages = {
@@ -73,6 +85,9 @@ private:
         {".js", "application/javascript"},
         {".ico", "image/x-icon"}
     };
+
+	map<int,shared_ptr<ConnectionState>> connections;
+	mutex Connections_mutex;
 
 public:
     HTTPServer(unsigned short p, const string& root) : port(p), doc_root(root) {}
@@ -115,6 +130,7 @@ public:
 
         cout << "Server listening on port " << port << endl;
         cout << "Document root: " << doc_root << endl;
+        cout << "HTTP/1.1 Pipelining: ENABLED" << endl;
         return true;
     }
 
@@ -129,8 +145,8 @@ public:
                 continue;
             }
 
-            // 为每个连接创建新线程
-            thread client_thread(&HTTPServer::handle_client, this, client_fd);
+            // 为每个连接创建新线程 - 修改为管道
+            thread client_thread(&HTTPServer::handle_pipelined_client, this, client_fd);
             client_thread.detach();
         }
     }
@@ -142,47 +158,125 @@ public:
     }
 
 private:
-    void handle_client(int client_fd) {
-        char buffer[8192] = {0};
-        
-        // 读取请求（组帧阶段）
-        ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
-        if (bytes_read <= 0) {
-            close(client_fd);
-            return;
-        }
+    void handle_pipelined_client(int client_fd) {
 
-        try {
-            // 解析请求
-            HTTPRequest request = parse_request(string(buffer, bytes_read));
-            
-            // 处理请求并生成响应
-            HTTPResponse response = process_request(request);
-            
-            // 发送响应（组帧阶段）
-            send_response(client_fd, response);
-        } catch (const exception& e) {
-            cerr << "Error handling client request: " << e.what() << endl;
-            // 发送500错误响应
-            HTTPResponse error_response = create_error_response(500, "Internal Server Error");
-            send_response(client_fd, error_response);
-        }
-        
-        close(client_fd);
+		auto conn_state = make_shared<ConnectionState> (client_fd);
+
+		{
+			lock_guard<mutex> lock(Connections_mutex);
+			connections[client_fd] = conn_state;
+		}
+
+        char buffer[8192] = {0};
+		bool connection_alive = true;
+
+		while(connection_alive){
+			struct timeval timeout;
+			timeout.tv_sec = CONNECTION_TIMEOUT;
+			timeout.tv_usec = 0;
+
+			fd_set read_fds;
+			FD_ZERO(&read_fds);
+			FD_SET(client_fd,&read_fds);
+
+			int activity = select(client_fd+1,&read_fds,NULL,NULL,&timeout);
+
+			if(activity<0&&errno != EINTR){
+				cerr<<"Select error:"<<strerror(errno)<<endl;
+				break;
+			}
+
+			if(activity==0){
+				cout<<"Connection timeout: "<<client_fd<<endl;
+				break;
+			}
+
+			if(FD_ISSET(client_fd,&read_fds)){
+				ssize_t bytes_read = read(client_fd,buffer,sizeof(buffer)-1);
+				if(bytes_read<=0){
+					connection_alive = false;
+					break;
+				}
+
+				buffer[bytes_read] = '\0';
+				conn_state -> read_buffer.append(buffer,bytes_read);
+				conn_state -> last_activity = time(nullptr);
+
+				parse_request(conn_state);
+
+				while(!conn_state->request_queue.empty()){
+					HTTPRequest request = conn_state ->request_queue.front();
+					conn_state -> request_queue.pop();
+
+					if(request.headers.find("Connection")!=request.headers.end()){
+						string connection_value = request.headers["Connection"];
+
+						for (char& c : connection_value){
+							c = tolower(c);
+						}
+						if(connection_value == "close"){
+							conn_state ->keep_alive = false;
+						}
+					}
+
+					HTTPResponse response = process_request(request);
+
+					if (conn_state->keep_alive){
+						response.headers["Connection"] = "keep-alive";
+					}else{
+						response.headers["Connection"] = "close";
+					}
+
+					send_response(client_fd,response);
+				}
+
+				if (!conn_state->keep_alive){
+					connection_alive = false;
+				}
+			}
+		}
+		
+		{
+			lock_guard<mutex> lock(Connections_mutex);
+			connections.erase(client_fd);
+		}
+		close(client_fd);
+		cout<<"Connection closed: "<<client_fd<<endl;
     }
 
-    // 解析HTTP请求（解析阶段）
+	// 解析多个请求
+	void parse_request(shared_ptr<ConnectionState> conn_state){
+		size_t pos = 0;
+
+		while(pos <conn_state->read_buffer.length()){
+			size_t header_end = conn_state->read_buffer.find("\r\n\r\n",pos);
+			if(header_end == string::npos){
+				break;
+			}
+
+			size_t request_end = header_end + 4;
+			string request_str = conn_state->read_buffer.substr(pos,request_end - pos);
+			HTTPRequest request = parse_request(request_str);
+
+			conn_state->request_queue.push(request);
+			pos = request_end;
+		}
+
+		if(pos > 0){
+			conn_state ->read_buffer.erase(0,pos);
+		}
+	}
+
+	// 解析
     HTTPRequest parse_request(const string& request_data) {
         HTTPRequest request;
         istringstream stream(request_data);
         string line;
         
-        // 解析请求行
         if (getline(stream, line)) {
             istringstream line_stream(line);
             line_stream >> request.method >> request.url >> request.version;
             
-            // 移除可能的CR字符
             if (!request.version.empty() && request.version.back() == '\r') {
                 request.version.pop_back();
             }
@@ -195,7 +289,6 @@ private:
                 string key = line.substr(0, colon_pos);
                 string value = line.substr(colon_pos + 1);
                 
-                // 移除首尾空白字符和CR
                 key.erase(0, key.find_first_not_of(" \t"));
                 key.erase(key.find_last_not_of(" \t\r") + 1);
                 value.erase(0, value.find_first_not_of(" \t"));
@@ -212,29 +305,24 @@ private:
     HTTPResponse process_request(const HTTPRequest& request) {
         HTTPResponse response;
         
-        // 检查方法
         if (request.method != "GET") {
             return create_error_response(400, "Only GET method is supported");
         }
 
-        // 检查Host头部
         if (request.headers.find("Host") == request.headers.end()) {
             return create_error_response(400, "Host header is required");
         }
 
-        // 处理url
         string url = request.url;
         if (url == "/") {
             url = "/index.html";
         }
 
-        // 构建文件路径并检查安全性
         string file_path = map_url_to_path(url);
         if (file_path.empty()) {
             return create_error_response(404, "File not found or path traversal attempt detected");
         }
 
-        // 检查文件是否存在和权限
         struct stat file_stat;
         if (stat(file_path.c_str(), &file_stat) < 0) {
             if (errno == ENOENT) {
@@ -245,7 +333,6 @@ private:
         }
 
         if (S_ISDIR(file_stat.st_mode)) {
-            // 如果是目录，尝试查找index.html
             string index_path = file_path;
             if (index_path.back() != '/') {
                 index_path += "/";
@@ -267,17 +354,14 @@ private:
             return create_error_response(403, "Permission denied");
         }
 
-        // 成功找到文件
         response.status_code = 200;
         response.status_message = status_messages[200];
         response.file_path = file_path;
         response.send_file = true;
         
-        // 设置响应头部
         response.headers["Server"] = "TritonHTTP/1.0";
         response.headers["Last-Modified"] = format_time(file_stat.st_mtime);
         
-        // 设置Content-Type
         string content_type = get_content_type(file_path);
         if (!content_type.empty()) {
             response.headers["Content-Type"] = content_type;
@@ -288,7 +372,6 @@ private:
         return response;
     }
 
-    // 创建错误响应
     HTTPResponse create_error_response(int status_code, const string& message) {
         HTTPResponse response;
         response.status_code = status_code;
@@ -320,7 +403,6 @@ private:
         // 空行分隔头部和正文
         response_str += "\r\n";
         
-        // 发送头部
         ssize_t sent = send(client_fd, response_str.c_str(), response_str.length(), 0);
         if (sent < 0) {
             cerr << "Failed to send response headers: " << strerror(errno) << endl;
@@ -339,7 +421,6 @@ private:
         }
     }
 
-    // 将相对url映射到绝对文件路径
     string map_url_to_path(const string& url) {
         // 安全检查：防止路径遍历攻击
         size_t pos = 0;
@@ -348,10 +429,8 @@ private:
         // 移除所有的 "../"
         while ((pos = normalized_url.find("/../")) != string::npos) {
             if (pos == 0) {
-                // 试图跳出根目录
                 return "";
             }
-            // 找到前一个斜杠
             size_t prev_slash = normalized_url.rfind('/', pos - 1);
             if (prev_slash == string::npos) {
                 return "";
@@ -359,7 +438,6 @@ private:
             normalized_url.erase(prev_slash, pos - prev_slash + 3);
         }
         
-        // 检查开头的 ".."
         if (normalized_url.find("../") == 0) {
             return "";
         }
@@ -368,7 +446,6 @@ private:
         return path;
     }
 
-    // 获取文件的内容类型
     string get_content_type(const string& file_path) {
         size_t dot_pos = file_path.find_last_of('.');
         if (dot_pos == string::npos) {
@@ -376,7 +453,6 @@ private:
         }
         
         string extension = file_path.substr(dot_pos);
-        // 转换为小写进行比较
         string extension_lower = extension;
         transform(extension_lower.begin(), extension_lower.end(), extension_lower.begin(), ::tolower);
         
@@ -411,7 +487,6 @@ private:
         close(file_fd);
     }
 
-    // 格式化时间（用于Last-Modified头部）
     string format_time(time_t time_val) {
         struct tm* tm_info = gmtime(&time_val);
         if (!tm_info) {
