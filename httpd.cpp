@@ -15,6 +15,12 @@
 #include <thread>
 #include <algorithm>
 #include <system_error>
+#include <queue>
+#include <memory>
+#include <sys/select.h>
+#include <errno.h>
+#include <mutex>
+#include <netdb.h>
 
 // 平台特定的头文件
 #ifdef __APPLE__
@@ -34,6 +40,7 @@ struct HTTPRequest {
     string version;
     map<string, string> headers;
     string body;
+	string client_ip;
 };
 
 // HTTP响应结构体
@@ -46,14 +53,25 @@ struct HTTPResponse {
     bool send_file;
 };
 
-struct ConnectionState{
-	int fd;
-	string read_buffer;
-	queue<HTTPRequest> request_queue;
-	bool keep_alive;
-	time_t last_activity;
+// IP规则结构体
+struct AccessRule{
+	bool allow;
+	string target;
+};
 
-	ConnectionState(int socketfd):fd(socketfd),keep_alive(true),last_activity(time(nullptr)){}
+struct ConnectionState{
+    int fd;
+    string read_buffer;
+    queue<HTTPRequest> request_queue;
+    bool keep_alive;
+    time_t last_activity;
+    string client_ip;
+
+    ConnectionState(int socketfd, const string& ip)
+        : fd(socketfd), 
+          keep_alive(true), 
+          last_activity(time(nullptr)), 
+          client_ip(ip) {} 
 };
 
 class HTTPServer {
@@ -88,6 +106,7 @@ private:
 
 	map<int,shared_ptr<ConnectionState>> connections;
 	mutex Connections_mutex;
+
 
 public:
     HTTPServer(unsigned short p, const string& root) : port(p), doc_root(root) {}
@@ -131,6 +150,7 @@ public:
         cout << "Server listening on port " << port << endl;
         cout << "Document root: " << doc_root << endl;
         cout << "HTTP/1.1 Pipelining: ENABLED" << endl;
+        cout << "IP-based Access Control: ENABLED" << endl;
         return true;
     }
 
@@ -145,8 +165,10 @@ public:
                 continue;
             }
 
+            string client_ip = inet_ntoa(client_addr.sin_addr);
+
             // 为每个连接创建新线程 - 修改为管道
-            thread client_thread(&HTTPServer::handle_pipelined_client, this, client_fd);
+            thread client_thread(&HTTPServer::handle_pipelined_client, this, client_fd,string(client_ip));
             client_thread.detach();
         }
     }
@@ -158,9 +180,9 @@ public:
     }
 
 private:
-    void handle_pipelined_client(int client_fd) {
+    void handle_pipelined_client(int client_fd,string client_ip) {
 
-		auto conn_state = make_shared<ConnectionState> (client_fd);
+		auto conn_state = make_shared<ConnectionState> (client_fd,client_ip);
 
 		{
 			lock_guard<mutex> lock(Connections_mutex);
@@ -208,6 +230,8 @@ private:
 					HTTPRequest request = conn_state ->request_queue.front();
 					conn_state -> request_queue.pop();
 
+					request.client_ip = conn_state->client_ip;
+
 					if(request.headers.find("Connection")!=request.headers.end()){
 						string connection_value = request.headers["Connection"];
 
@@ -241,7 +265,7 @@ private:
 			connections.erase(client_fd);
 		}
 		close(client_fd);
-		cout<<"Connection closed: "<<client_fd<<endl;
+		cout<<"Connection clo	sed: "<<client_fd<<endl;
     }
 
 	// 解析多个请求
@@ -301,6 +325,144 @@ private:
         return request;
     }
 
+	bool check_access_control(const string& file_path,const string& client_ip){
+		
+		size_t last_slash = file_path.find_last_of('/');
+        string dir_path;
+        if (last_slash != string::npos) {
+            dir_path = file_path.substr(0, last_slash);
+        } else {
+            dir_path = ".";
+        }
+        
+        string htaccess_path = dir_path + "/.htaccess";
+
+        // 检查.htaccess文件是否存在
+        struct stat st;
+        if (stat(htaccess_path.c_str(), &st) != 0) {
+            // 如果没有.htaccess文件，默认允许访问
+            return true;
+        }
+        
+        if (!S_ISREG(st.st_mode)) {
+            // 不是常规文件，默认允许
+            return true;
+        }
+        
+        // 读取.htaccess文件
+        ifstream htaccess_file(htaccess_path);
+        if (!htaccess_file.is_open()) {
+            cerr << "Failed to open .htaccess file: " << htaccess_path << " (error: " << strerror(errno) << ")" << endl;
+            return true; // 如果无法读取，默认允许
+        }
+        
+        vector<AccessRule> rules;
+        string line;
+        
+        // 解析规则
+        while (getline(htaccess_file, line)) {
+            // 跳过空行和注释
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            
+            istringstream line_stream(line);
+            string action, from, target;
+            line_stream >> action >> from >> target;
+            
+            if (from != "from" || (action != "allow" && action != "deny")) {
+                cerr << "Invalid rule in .htaccess: " << line << endl;
+                continue;
+            }
+            
+            AccessRule rule;
+            rule.allow = (action == "allow");
+            rule.target = target;
+            rules.push_back(rule);
+        }
+        
+        htaccess_file.close();
+        
+        // 如果没有规则，默认允许
+        if (rules.empty()) {
+            return true;
+        }
+        
+        // 按顺序应用规则
+        for (const auto& rule : rules) {
+            if (match_ip_rule(client_ip, rule.target)) {
+                return rule.allow;
+            }
+        }
+        
+        // 如果没有匹配的规则，默认拒绝
+        return false;
+	}
+
+    // IP规则匹配 - 修复CIDR计算
+    bool match_ip_rule(const string& client_ip, const string& rule_target) {
+        // 检查是否是CIDR格式
+        size_t slash_pos = rule_target.find('/');
+        if (slash_pos != string::npos) {
+            // CIDR格式
+            string network_str = rule_target.substr(0, slash_pos);
+            string prefix_len_str = rule_target.substr(slash_pos + 1);
+            
+            int prefix_len;
+            try {
+                prefix_len = stoi(prefix_len_str);
+            } catch (const exception& e) {
+                cerr << "Invalid prefix length in CIDR: " << rule_target << endl;
+                return false;
+            }
+            
+            if (prefix_len < 0 || prefix_len > 32) {
+                cerr << "Invalid prefix length: " << prefix_len << endl;
+                return false;
+            }
+            
+            // 转换IP地址为整数
+            struct in_addr client_addr, network_addr;
+            if (inet_pton(AF_INET, client_ip.c_str(), &client_addr) != 1 ||
+                inet_pton(AF_INET, network_str.c_str(), &network_addr) != 1) {
+                return false;
+            }
+            
+            // 计算掩码
+            uint32_t mask = (prefix_len == 0) ? 0 : ~((1U << (32 - prefix_len)) - 1);
+            
+            // 比较网络地址
+            return (ntohl(client_addr.s_addr) & mask) == (ntohl(network_addr.s_addr) & mask);
+        } else if (rule_target == "0.0.0.0/0") {
+            // 特殊处理：匹配所有IP
+            return true;
+        } else {
+            // 可能是主机名或具体IP
+            // 首先检查是否是具体IP
+            struct in_addr ip_addr;
+            if (inet_pton(AF_INET, rule_target.c_str(), &ip_addr) == 1) {
+                // 具体IP
+                return client_ip == rule_target;
+            } else {
+                // 尝试解析主机名
+                struct hostent* host = gethostbyname(rule_target.c_str());
+                if (host == nullptr) {
+                    return false;
+                }
+                
+                // 检查客户端IP是否在解析的IP列表中
+                for (int i = 0; host->h_addr_list[i] != nullptr; i++) {
+                    char* ip_str = inet_ntoa(*(struct in_addr*)host->h_addr_list[i]);
+                    if (client_ip == string(ip_str)) {
+                        return true;
+                    }
+                }
+                
+                return false;
+            }
+        }
+    }
+
     // 处理HTTP请求
     HTTPResponse process_request(const HTTPRequest& request) {
         HTTPResponse response;
@@ -323,6 +485,11 @@ private:
             return create_error_response(404, "File not found or path traversal attempt detected");
         }
 
+        if (!check_access_control(file_path, request.client_ip)) {
+            cerr << "Access denied for IP " << request.client_ip << " to " << file_path << endl;
+            return create_error_response(403, "Access denied by .htaccess rules");
+        }
+
         struct stat file_stat;
         if (stat(file_path.c_str(), &file_stat) < 0) {
             if (errno == ENOENT) {
@@ -330,7 +497,7 @@ private:
             } else {
                 return create_error_response(500, "Internal server error while accessing file");
             }
-        }
+        }	
 
         if (S_ISDIR(file_stat.st_mode)) {
             string index_path = file_path;
@@ -391,16 +558,13 @@ private:
     void send_response(int client_fd, const HTTPResponse& response) {
         string response_str;
         
-        // 构建状态行
         response_str = "HTTP/1.1 " + to_string(response.status_code) + " " +
                       response.status_message + "\r\n";
         
-        // 添加头部
         for (const auto& header : response.headers) {
             response_str += header.first + ": " + header.second + "\r\n";
         }
         
-        // 空行分隔头部和正文
         response_str += "\r\n";
         
         ssize_t sent = send(client_fd, response_str.c_str(), response_str.length(), 0);
@@ -409,11 +573,9 @@ private:
             return;
         }
         
-        // 如果是200响应且需要发送文件，发送文件内容
         if (response.send_file && response.status_code == 200 && !response.file_path.empty()) {
             send_file(client_fd, response.file_path);
         } else if (!response.body.empty()) {
-            // 发送错误消息正文
             sent = send(client_fd, response.body.c_str(), response.body.length(), 0);
             if (sent < 0) {
                 cerr << "Failed to send response body: " << strerror(errno) << endl;
