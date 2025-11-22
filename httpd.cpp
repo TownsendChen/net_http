@@ -40,7 +40,7 @@ struct HTTPRequest {
     string version;
     map<string, string> headers;
     string body;
-	string client_ip;
+    string client_ip;
 };
 
 // HTTP响应结构体
@@ -53,25 +53,21 @@ struct HTTPResponse {
     bool send_file;
 };
 
-// IP规则结构体
-struct AccessRule{
-	bool allow;
-	string target;
+// 访问规则结构体
+struct AccessRule {
+    bool allow;
+    string target;
 };
 
 struct ConnectionState{
-    int fd;
-    string read_buffer;
-    queue<HTTPRequest> request_queue;
-    bool keep_alive;
-    time_t last_activity;
+	int fd;
+	string read_buffer;
+	queue<HTTPRequest> request_queue;
+	bool keep_alive;
+	time_t last_activity;
     string client_ip;
 
-    ConnectionState(int socketfd, const string& ip)
-        : fd(socketfd), 
-          keep_alive(true), 
-          last_activity(time(nullptr)), 
-          client_ip(ip) {} 
+	ConnectionState(int socketfd, string ip):fd(socketfd),keep_alive(true),last_activity(time(nullptr)),client_ip(ip){}
 };
 
 class HTTPServer {
@@ -82,7 +78,6 @@ private:
 
 	const int CONNECTION_TIMEOUT = 5;
 
-    // HTTP状态码映射
     map<int, string> status_messages = {
         {200, "OK"},
         {400, "Bad Request"},
@@ -91,7 +86,6 @@ private:
         {500, "Internal Server Error"}
     };
 
-    // 文件类型映射
     map<string, string> content_types = {
         {".html", "text/html"},
         {".htm", "text/html"},
@@ -107,19 +101,16 @@ private:
 	map<int,shared_ptr<ConnectionState>> connections;
 	mutex Connections_mutex;
 
-
 public:
     HTTPServer(unsigned short p, const string& root) : port(p), doc_root(root) {}
 
     bool initialize() {
-        // 创建socket
         server_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (server_fd < 0) {
             cerr << "Failed to create socket: " << strerror(errno) << endl;
             return false;
         }
 
-        // 设置socket选项
         int opt = 1;
         if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
             cerr << "Failed to set socket options: " << strerror(errno) << endl;
@@ -127,7 +118,6 @@ public:
             return false;
         }
 
-        // 绑定地址
         struct sockaddr_in address;
         memset(&address, 0, sizeof(address));
         address.sin_family = AF_INET;
@@ -140,7 +130,6 @@ public:
             return false;
         }
 
-        // 开始监听
         if (listen(server_fd, 10) < 0) {
             cerr << "Failed to listen on socket: " << strerror(errno) << endl;
             close(server_fd);
@@ -167,8 +156,7 @@ public:
 
             string client_ip = inet_ntoa(client_addr.sin_addr);
 
-            // 为每个连接创建新线程 - 修改为管道
-            thread client_thread(&HTTPServer::handle_pipelined_client, this, client_fd,string(client_ip));
+            thread client_thread(&HTTPServer::handle_pipelined_client, this, client_fd, client_ip);
             client_thread.detach();
         }
     }
@@ -180,118 +168,115 @@ public:
     }
 
 private:
-    void handle_pipelined_client(int client_fd,string client_ip) {
+    void handle_pipelined_client(int client_fd, string client_ip) {
+        auto conn_state = make_shared<ConnectionState> (client_fd, client_ip);
 
-		auto conn_state = make_shared<ConnectionState> (client_fd,client_ip);
-
-		{
-			lock_guard<mutex> lock(Connections_mutex);
-			connections[client_fd] = conn_state;
-		}
+        {
+            lock_guard<mutex> lock(Connections_mutex);
+            connections[client_fd] = conn_state;
+        }
 
         char buffer[8192] = {0};
-		bool connection_alive = true;
+        bool connection_alive = true;
 
-		while(connection_alive){
-			struct timeval timeout;
-			timeout.tv_sec = CONNECTION_TIMEOUT;
-			timeout.tv_usec = 0;
+        while(connection_alive){
+            struct timeval timeout;
+            timeout.tv_sec = CONNECTION_TIMEOUT;
+            timeout.tv_usec = 0;
 
-			fd_set read_fds;
-			FD_ZERO(&read_fds);
-			FD_SET(client_fd,&read_fds);
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(client_fd,&read_fds);
 
-			int activity = select(client_fd+1,&read_fds,NULL,NULL,&timeout);
+            int activity = select(client_fd+1,&read_fds,NULL,NULL,&timeout);
 
-			if(activity<0&&errno != EINTR){
-				cerr<<"Select error:"<<strerror(errno)<<endl;
-				break;
-			}
+            if(activity<0&&errno != EINTR){
+                cerr<<"Select error:"<<strerror(errno)<<endl;
+                break;
+            }
 
-			if(activity==0){
-				cout<<"Connection timeout: "<<client_fd<<endl;
-				break;
-			}
+            if(activity==0){
+                cout<<"Connection timeout: "<<client_fd<<endl;
+                break;
+            }
 
-			if(FD_ISSET(client_fd,&read_fds)){
-				ssize_t bytes_read = read(client_fd,buffer,sizeof(buffer)-1);
-				if(bytes_read<=0){
-					connection_alive = false;
-					break;
-				}
+            if(FD_ISSET(client_fd,&read_fds)){
+                ssize_t bytes_read = read(client_fd,buffer,sizeof(buffer)-1);
+                if(bytes_read<=0){
+                    connection_alive = false;
+                    break;
+                }
 
-				buffer[bytes_read] = '\0';
-				conn_state -> read_buffer.append(buffer,bytes_read);
-				conn_state -> last_activity = time(nullptr);
+                buffer[bytes_read] = '\0';
+                conn_state -> read_buffer.append(buffer,bytes_read);
+                conn_state -> last_activity = time(nullptr);
 
-				parse_request(conn_state);
+                parse_requests(conn_state);
 
-				while(!conn_state->request_queue.empty()){
-					HTTPRequest request = conn_state ->request_queue.front();
-					conn_state -> request_queue.pop();
+                while(!conn_state->request_queue.empty()){
+                    HTTPRequest request = conn_state ->request_queue.front();
+                    conn_state -> request_queue.pop();
 
-					request.client_ip = conn_state->client_ip;
+                    request.client_ip = conn_state->client_ip;
 
-					if(request.headers.find("Connection")!=request.headers.end()){
-						string connection_value = request.headers["Connection"];
+                    if(request.headers.find("Connection")!=request.headers.end()){
+                        string connection_value = request.headers["Connection"];
 
-						for (char& c : connection_value){
-							c = tolower(c);
-						}
-						if(connection_value == "close"){
-							conn_state ->keep_alive = false;
-						}
-					}
+                        for (char& c : connection_value){
+                            c = tolower(c);
+                        }
+                        if(connection_value == "close"){
+                            conn_state ->keep_alive = false;
+                        }
+                    }
 
-					HTTPResponse response = process_request(request);
+                    HTTPResponse response = process_request(request);
 
-					if (conn_state->keep_alive){
-						response.headers["Connection"] = "keep-alive";
-					}else{
-						response.headers["Connection"] = "close";
-					}
+                    if (conn_state->keep_alive){
+                        response.headers["Connection"] = "keep-alive";
+                    }else{
+                        response.headers["Connection"] = "close";
+                    }
 
-					send_response(client_fd,response);
-				}
+                    send_response(client_fd,response);
+                }
 
-				if (!conn_state->keep_alive){
-					connection_alive = false;
-				}
-			}
-		}
-		
-		{
-			lock_guard<mutex> lock(Connections_mutex);
-			connections.erase(client_fd);
-		}
-		close(client_fd);
-		cout<<"Connection clo	sed: "<<client_fd<<endl;
+                if (!conn_state->keep_alive){
+                    connection_alive = false;
+                }
+            }
+        }
+        
+        {
+            lock_guard<mutex> lock(Connections_mutex);
+            connections.erase(client_fd);
+        }
+        close(client_fd);
+        cout<<"Connection closed: "<<client_fd<<endl;
     }
 
-	// 解析多个请求
-	void parse_request(shared_ptr<ConnectionState> conn_state){
-		size_t pos = 0;
+    void parse_requests(shared_ptr<ConnectionState> conn_state){
+        size_t pos = 0;
 
-		while(pos <conn_state->read_buffer.length()){
-			size_t header_end = conn_state->read_buffer.find("\r\n\r\n",pos);
-			if(header_end == string::npos){
-				break;
-			}
+        while(pos <conn_state->read_buffer.length()){
+            size_t header_end = conn_state->read_buffer.find("\r\n\r\n",pos);
+            if(header_end == string::npos){
+                break;
+            }
 
-			size_t request_end = header_end + 4;
-			string request_str = conn_state->read_buffer.substr(pos,request_end - pos);
-			HTTPRequest request = parse_request(request_str);
+            size_t request_end = header_end + 4;
+            string request_str = conn_state->read_buffer.substr(pos,request_end - pos);
+            HTTPRequest request = parse_request(request_str);
 
-			conn_state->request_queue.push(request);
-			pos = request_end;
-		}
+            conn_state->request_queue.push(request);
+            pos = request_end;
+        }
 
-		if(pos > 0){
-			conn_state ->read_buffer.erase(0,pos);
-		}
-	}
+        if(pos > 0){
+            conn_state ->read_buffer.erase(0,pos);
+        }
+    }
 
-	// 解析
     HTTPRequest parse_request(const string& request_data) {
         HTTPRequest request;
         istringstream stream(request_data);
@@ -306,7 +291,6 @@ private:
             }
         }
 
-        // 解析头部
         while (getline(stream, line) && line != "\r" && !line.empty()) {
             size_t colon_pos = line.find(':');
             if (colon_pos != string::npos) {
@@ -325,27 +309,27 @@ private:
         return request;
     }
 
-	bool check_access_control(const string& file_path,const string& client_ip){
-		
-		size_t last_slash = file_path.find_last_of('/');
-        string dir_path;
-        if (last_slash != string::npos) {
-            dir_path = file_path.substr(0, last_slash);
-        } else {
-            dir_path = ".";
-        }
+    // 修复的访问控制检查函数
+    bool check_access_control(const string& file_path, const string& client_ip) {
+        cout << "Checking access control for: " << file_path << " from IP: " << client_ip << endl;
         
+        // 获取文件所在目录
+        string dir_path = get_directory_path(file_path);
         string htaccess_path = dir_path + "/.htaccess";
-
+        
+        cout << "Looking for .htaccess at: " << htaccess_path << endl;
+        
         // 检查.htaccess文件是否存在
         struct stat st;
         if (stat(htaccess_path.c_str(), &st) != 0) {
-            // 如果没有.htaccess文件，默认允许访问
+            // 文件不存在，默认允许访问
+            cout << "No .htaccess file found, allowing access" << endl;
             return true;
         }
         
         if (!S_ISREG(st.st_mode)) {
             // 不是常规文件，默认允许
+            cout << ".htaccess is not a regular file, allowing access" << endl;
             return true;
         }
         
@@ -379,28 +363,45 @@ private:
             rule.allow = (action == "allow");
             rule.target = target;
             rules.push_back(rule);
+            cout << "Loaded rule: " << (rule.allow ? "allow" : "deny") << " from " << rule.target << endl;
         }
         
         htaccess_file.close();
         
         // 如果没有规则，默认允许
         if (rules.empty()) {
+            cout << "No rules in .htaccess, allowing access" << endl;
             return true;
         }
         
         // 按顺序应用规则
         for (const auto& rule : rules) {
             if (match_ip_rule(client_ip, rule.target)) {
+                cout << "Rule matched: " << (rule.allow ? "ALLOW" : "DENY") << " from " << rule.target << endl;
                 return rule.allow;
             }
         }
         
         // 如果没有匹配的规则，默认拒绝
+        cout << "No rules matched, default DENY" << endl;
         return false;
-	}
-
-    // IP规则匹配 - 修复CIDR计算
+    }
+    
+    // 获取目录路径的辅助函数
+    string get_directory_path(const string& file_path) {
+        size_t last_slash = file_path.find_last_of('/');
+        if (last_slash == string::npos) {
+            return doc_root;
+        }
+        return file_path.substr(0, last_slash);
+    }
+    
     bool match_ip_rule(const string& client_ip, const string& rule_target) {
+        // 特殊处理：0.0.0.0/0 匹配所有
+        if (rule_target == "0.0.0.0/0") {
+            return true;
+        }
+        
         // 检查是否是CIDR格式
         size_t slash_pos = rule_target.find('/');
         if (slash_pos != string::npos) {
@@ -430,15 +431,12 @@ private:
             
             // 计算掩码
             uint32_t mask = (prefix_len == 0) ? 0 : ~((1U << (32 - prefix_len)) - 1);
+            mask = htonl(mask);
             
             // 比较网络地址
-            return (ntohl(client_addr.s_addr) & mask) == (ntohl(network_addr.s_addr) & mask);
-        } else if (rule_target == "0.0.0.0/0") {
-            // 特殊处理：匹配所有IP
-            return true;
+            return (client_addr.s_addr & mask) == (network_addr.s_addr & mask);
         } else {
-            // 可能是主机名或具体IP
-            // 首先检查是否是具体IP
+            // 具体IP或主机名
             struct in_addr ip_addr;
             if (inet_pton(AF_INET, rule_target.c_str(), &ip_addr) == 1) {
                 // 具体IP
@@ -450,7 +448,6 @@ private:
                     return false;
                 }
                 
-                // 检查客户端IP是否在解析的IP列表中
                 for (int i = 0; host->h_addr_list[i] != nullptr; i++) {
                     char* ip_str = inet_ntoa(*(struct in_addr*)host->h_addr_list[i]);
                     if (client_ip == string(ip_str)) {
@@ -463,7 +460,6 @@ private:
         }
     }
 
-    // 处理HTTP请求
     HTTPResponse process_request(const HTTPRequest& request) {
         HTTPResponse response;
         
@@ -485,7 +481,11 @@ private:
             return create_error_response(404, "File not found or path traversal attempt detected");
         }
 
-        if (!check_access_control(file_path, request.client_ip)) {
+        cout << "Processing request for: " << file_path << endl;
+
+        // 检查访问控制
+        bool access_allowed = check_access_control(file_path, request.client_ip);
+        if (!access_allowed) {
             cerr << "Access denied for IP " << request.client_ip << " to " << file_path << endl;
             return create_error_response(403, "Access denied by .htaccess rules");
         }
@@ -497,7 +497,7 @@ private:
             } else {
                 return create_error_response(500, "Internal server error while accessing file");
             }
-        }	
+        }
 
         if (S_ISDIR(file_stat.st_mode)) {
             string index_path = file_path;
@@ -554,7 +554,6 @@ private:
         return response;
     }
 
-    // 发送HTTP响应
     void send_response(int client_fd, const HTTPResponse& response) {
         string response_str;
         
@@ -584,11 +583,9 @@ private:
     }
 
     string map_url_to_path(const string& url) {
-        // 安全检查：防止路径遍历攻击
         size_t pos = 0;
         string normalized_url = url;
         
-        // 移除所有的 "../"
         while ((pos = normalized_url.find("/../")) != string::npos) {
             if (pos == 0) {
                 return "";
@@ -626,7 +623,6 @@ private:
         return "application/octet-stream";
     }
 
-    // 跨平台文件发送函数
     void send_file(int client_fd, const string& file_path) {
         int file_fd = open(file_path.c_str(), O_RDONLY);
         if (file_fd < 0) {
@@ -634,7 +630,6 @@ private:
             return;
         }
         
-        // 使用通用的read/write方法发送文件，确保跨平台兼容性
         char buffer[8192];
         ssize_t bytes_read;
         
@@ -666,7 +661,6 @@ void start_httpd(unsigned short port, string doc_root)
     cerr << "Starting server (port: " << port <<
         ", doc_root: " << doc_root << ")" << endl;
 
-    // 检查文档根目录是否存在且可访问
     struct stat stat_buf;
     if (stat(doc_root.c_str(), &stat_buf) != 0 || !S_ISDIR(stat_buf.st_mode)) {
         cerr << "Document root does not exist or is not a directory: " << doc_root << endl;
